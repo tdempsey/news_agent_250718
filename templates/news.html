@@ -334,7 +334,7 @@
                     
                     {% if article.content %}
                     <p class="article-description">
-                        {{ article.content[:200] }}{% if article.content|length > 200 %}...{% endif %}
+                        {{ article.content | striptags | truncate(200) }}
                     </p>
                     {% endif %}
                 </div>
