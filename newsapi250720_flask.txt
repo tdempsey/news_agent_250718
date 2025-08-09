@@ -1,0 +1,335 @@
+from flask import Flask, render_template, jsonify, request, redirect
+import feedparser
+import requests
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+import hashlib
+import logging
+from dataclasses import dataclass
+from urllib.parse import urljoin, urlparse
+import time
+import re
+from bs4 import BeautifulSoup
+
+@dataclass
+class Article:
+    """Data class for news articles with thumbnail support"""
+    title: str
+    content: str
+    url: str
+    published_date: datetime
+    source: str
+    thumbnail_url: Optional[str] = None
+    country: Optional[str] = None
+    hash_id: str = ""
+    
+    def __post_init__(self):
+        content_hash = hashlib.md5(f"{self.title}{self.url}".encode()).hexdigest()
+        self.hash_id = content_hash
+
+class LGBTQNewsCollector:
+    """Main news collection module for LGBTQ+ content with thumbnail extraction"""
+    
+    def __init__(self, newsapi_key: Optional[str] = None):
+        self.newsapi_key = "eb080d6f006a4d068a852f914673d458"
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'LGBTQ-News-Agent/1.0'
+        })
+        
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        
+        self.rss_feeds = {
+            'advocate': 'https://www.advocate.com/rss.xml',
+            'pinknews': 'https://www.pinknews.co.uk/feed/',
+            'queerty': 'https://www.queerty.com/feed',
+            'lgbtqnation': 'https://www.lgbtqnation.com/feed/',
+            'washington_blade': 'https://www.washingtonblade.com/feed/',
+            'outsports': 'https://www.outsports.com/rss/index.xml',
+            'them': 'https://www.them.us/feed/rss',
+            'gaycitynews': 'https://gaycitynews.com/feed/',
+        }
+        
+        self.lgbtq_keywords = [
+            'LGBTQ', 'LGBT', 'gay', 'lesbian', 'transgender', 'bisexual', 
+            'queer', 'pride', 'rainbow', 'homosexual', 'same-sex', 
+            'gender identity', 'sexual orientation', 'marriage equality',
+            'trans rights', 'gay rights', 'GLAAD', 'Pride Month'
+        ]
+
+    def extract_thumbnail_from_rss(self, entry) -> Optional[str]:
+        """Extract thumbnail image from RSS entry"""
+        # Check for media:thumbnail or media:content
+        if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
+            return entry.media_thumbnail[0].get('url')
+        
+        if hasattr(entry, 'media_content') and entry.media_content:
+            for media in entry.media_content:
+                if media.get('type', '').startswith('image'):
+                    return media.get('url')
+        
+        # Check for enclosure
+        if hasattr(entry, 'enclosures') and entry.enclosures:
+            for enclosure in entry.enclosures:
+                if enclosure.get('type', '').startswith('image'):
+                    return enclosure.get('href')
+        
+        # Parse content for images
+        content = self._extract_content(entry)
+        if content:
+            img_match = re.search(r'<img[^>]+src=[\'"]([^\'"]+)[\'"][^>]*>', content)
+            if img_match:
+                return img_match.group(1)
+        
+        return None
+
+    def extract_thumbnail_from_url(self, url: str) -> Optional[str]:
+        """Extract thumbnail from article URL using Open Graph tags"""
+        try:
+            response = self.session.get(url, timeout=10)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # Try Open Graph image
+                og_image = soup.find('meta', property='og:image')
+                if og_image and og_image.get('content'):
+                    return og_image['content']
+                
+                # Try Twitter card image
+                twitter_image = soup.find('meta', attrs={'name': 'twitter:image'})
+                if twitter_image and twitter_image.get('content'):
+                    return twitter_image['content']
+                
+                # Try first image in content
+                img_tag = soup.find('img')
+                if img_tag and img_tag.get('src'):
+                    return urljoin(url, img_tag['src'])
+                    
+        except Exception as e:
+            self.logger.warning(f"Failed to extract thumbnail from {url}: {e}")
+        
+        return None
+
+    def collect_from_rss(self, hours_back: int = 24) -> List[Article]:
+        """Collect articles from RSS feeds with thumbnail extraction"""
+        articles = []
+        cutoff_time = datetime.now() - timedelta(hours=hours_back)
+        
+        for source_name, feed_url in self.rss_feeds.items():
+            try:
+                self.logger.info(f"Fetching RSS feed: {source_name}")
+                
+                feed = feedparser.parse(feed_url)
+                
+                if feed.bozo:
+                    self.logger.warning(f"RSS feed parsing warning for {source_name}: {feed.bozo_exception}")
+                
+                for entry in feed.entries:
+                    try:
+                        pub_date = self._parse_date(entry)
+                        
+                        if pub_date and pub_date < cutoff_time:
+                            continue
+                        
+                        content = self._extract_content(entry)
+                        thumbnail_url = self.extract_thumbnail_from_rss(entry)
+                        
+                        # If no thumbnail from RSS, try extracting from URL
+                        if not thumbnail_url:
+                            thumbnail_url = self.extract_thumbnail_from_url(entry.link)
+                        
+                        article = Article(
+                            title=entry.title,
+                            content=content,
+                            url=entry.link,
+                            published_date=pub_date or datetime.now(),
+                            source=source_name,
+                            thumbnail_url=thumbnail_url
+                        )
+                        
+                        articles.append(article)
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error processing entry from {source_name}: {e}")
+                        continue
+                
+                time.sleep(1)
+                
+            except Exception as e:
+                self.logger.error(f"Error fetching RSS feed {source_name}: {e}")
+                continue
+        
+        return articles
+
+    def collect_from_newsapi(self, hours_back: int = 24) -> List[Article]:
+        """Collect articles from NewsAPI with thumbnail support"""
+        if not self.newsapi_key:
+            self.logger.warning("NewsAPI key not provided, skipping NewsAPI collection")
+            return []
+        
+        articles = []
+        from_date = (datetime.now() - timedelta(hours=hours_back)).strftime('%Y-%m-%d')
+        
+        for keyword in self.lgbtq_keywords[:5]:
+            try:
+                url = "https://newsapi.org/v2/everything"
+                params = {
+                    'q': keyword,
+                    'from': from_date,
+                    'sortBy': 'publishedAt',
+                    'language': 'en',
+                    'apiKey': self.newsapi_key,
+                    'pageSize': 20
+                }
+                
+                response = self.session.get(url, params=params)
+                response.raise_for_status()
+                
+                data = response.json()
+                
+                for article_data in data.get('articles', []):
+                    try:
+                        if not article_data.get('content') or article_data['content'] == '[Removed]':
+                            continue
+                        
+                        pub_date = datetime.fromisoformat(
+                            article_data['publishedAt'].replace('Z', '+00:00')
+                        )
+                        
+                        thumbnail_url = article_data.get('urlToImage')
+                        
+                        article = Article(
+                            title=article_data['title'],
+                            content=article_data['description'] or article_data['content'],
+                            url=article_data['url'],
+                            published_date=pub_date,
+                            source=article_data['source']['name'],
+                            thumbnail_url=thumbnail_url
+                        )
+                        
+                        articles.append(article)
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error processing NewsAPI article: {e}")
+                        continue
+                
+                time.sleep(2)
+                
+            except Exception as e:
+                self.logger.error(f"Error fetching from NewsAPI with keyword '{keyword}': {e}")
+                continue
+        
+        return articles
+
+    def collect_all_sources(self, hours_back: int = 24) -> List[Article]:
+        """Collect from all available sources and deduplicate"""
+        all_articles = []
+        
+        rss_articles = self.collect_from_rss(hours_back)
+        all_articles.extend(rss_articles)
+        self.logger.info(f"Collected {len(rss_articles)} articles from RSS feeds")
+        
+        news_articles = self.collect_from_newsapi(hours_back)
+        all_articles.extend(news_articles)
+        self.logger.info(f"Collected {len(news_articles)} articles from NewsAPI")
+        
+        unique_articles = self._deduplicate_articles(all_articles)
+        self.logger.info(f"After deduplication: {len(unique_articles)} unique articles")
+        
+        return unique_articles
+
+    def _parse_date(self, entry) -> Optional[datetime]:
+        """Parse date from RSS entry"""
+        date_fields = ['published_parsed', 'updated_parsed']
+        
+        for field in date_fields:
+            if hasattr(entry, field) and getattr(entry, field):
+                try:
+                    time_struct = getattr(entry, field)
+                    return datetime(*time_struct[:6])
+                except:
+                    continue
+        
+        date_strings = ['published', 'updated']
+        for field in date_strings:
+            if hasattr(entry, field):
+                try:
+                    from dateutil import parser
+                    return parser.parse(getattr(entry, field))
+                except:
+                    continue
+        
+        return None
+
+    def _extract_content(self, entry) -> str:
+        """Extract content from RSS entry"""
+        content_fields = ['content', 'summary', 'description']
+        
+        for field in content_fields:
+            if hasattr(entry, field):
+                content = getattr(entry, field)
+                if isinstance(content, list) and content:
+                    return content[0].get('value', '')
+                elif isinstance(content, str):
+                    return content
+        
+        return ""
+
+    def _deduplicate_articles(self, articles: List[Article]) -> List[Article]:
+        """Remove duplicate articles based on hash_id"""
+        seen_hashes = set()
+        unique_articles = []
+        
+        for article in articles:
+            if article.hash_id not in seen_hashes:
+                seen_hashes.add(article.hash_id)
+                unique_articles.append(article)
+        
+        return unique_articles
+
+# Flask App
+app = Flask(__name__)
+collector = LGBTQNewsCollector()
+
+@app.route('/')
+def index():
+    """Main page displaying recent LGBTQ+ news articles"""
+    hours_back = request.args.get('hours', 24, type=int)
+    articles = collector.collect_all_sources(hours_back=hours_back)
+    
+    # Sort by publication date (newest first)
+    articles.sort(key=lambda x: x.published_date, reverse=True)
+    
+    return render_template('news.html', articles=articles, hours_back=hours_back)
+
+@app.route('/api/articles')
+def api_articles():
+    """API endpoint to get articles in JSON format"""
+    hours_back = request.args.get('hours', 24, type=int)
+    articles = collector.collect_all_sources(hours_back=hours_back)
+    
+    articles_data = []
+    for article in articles:
+        articles_data.append({
+            'title': article.title,
+            'content': article.content,
+            'url': article.url,
+            'published_date': article.published_date.isoformat(),
+            'source': article.source,
+            'thumbnail_url': article.thumbnail_url,
+            'hash_id': article.hash_id
+        })
+    
+    return jsonify({
+        'articles': articles_data,
+        'count': len(articles_data)
+    })
+
+@app.route('/refresh')
+def refresh():
+    """Force refresh of articles"""
+    return redirect('/')
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
